@@ -1,0 +1,266 @@
+
+
+#pragma kernel WriteHashRT
+#pragma kernel CSMain
+#pragma kernel Clear
+#pragma kernel FillHoles
+
+
+
+#define MAX 4294967295
+
+#define EPISON 1e-7
+
+#include"UnityCG.cginc"
+
+RWTexture2D<float4> ResultColor;
+RWTexture2D<uint>HashBuffer;
+
+Texture2D<float4> _CurrentTexture;
+
+SamplerState PointClampSampler;
+SamplerState LinearClampSampler;
+
+
+Texture2D<float> _DepthTexture;
+
+
+float _offsetMin;
+
+float _Threshold;
+float _Intensity;
+
+float _PlaneHeight;
+
+float2 _CameraSize;
+
+float4x4 _VPMatrix;
+float4x4 I_VPMatrix;
+float3 _CameraDir;
+
+
+bool _IsFill;
+
+
+
+float3 ReBuildWorldPos(uint2 dispatchId,inout float depth) {
+
+	float2 ScreenUV = dispatchId / _CameraSize;
+
+
+
+	 depth = _DepthTexture[dispatchId];
+
+#if defined(UNITY_REVERSED_Z)
+	depth = 1 - depth;
+#endif
+
+
+
+
+	float4 posCS = float4(ScreenUV * 2.0 - 1.0, depth*2-1, 1.0);
+	float4 posHWS = mul(I_VPMatrix, posCS);
+	float3 posWS = posHWS.xyz / posHWS.w;
+
+
+	return posWS;
+}
+
+float3 MirrorWorldPos(float3 WorldPos) {
+
+
+	return float3(WorldPos.x, -WorldPos.y + 2 * _PlaneHeight, WorldPos.z);
+
+
+}
+
+
+bool isOffset(float2 reflectUV, float2 originReflectUV,out float offset)
+{
+	
+    offset = abs(originReflectUV.x - reflectUV.x);
+	
+
+    if (offset > _offsetMin)
+        return true;
+	
+	
+    return false;
+}
+float2 MirrorWorldPosToScreenUV(float3 MirrorWorldPos, float3 WorldPos, out float4 reflectPosCS, out float2 originReflectUV)
+{
+
+	 reflectPosCS = mul(_VPMatrix, float4(MirrorWorldPos, 1));
+	
+	 float2 reflectPosInNdc = reflectPosCS.xy / reflectPosCS.ww;
+	
+	float2 reflectScreenUV = reflectPosInNdc *0.5f + 0.5f;
+	
+	
+     originReflectUV = reflectScreenUV;
+
+
+
+
+	float2 ndcUV = reflectScreenUV * 2 - 1;
+
+
+	float HeightStretch = (WorldPos.y - _PlaneHeight);
+
+	float AngleStretch = saturate(-_CameraDir.y);
+	float ScreenStretch = saturate(abs(ndcUV.x) - _Threshold);
+
+	ndcUV.x *= 1 + HeightStretch * AngleStretch * ScreenStretch * _Intensity;
+
+
+	ndcUV.x = ndcUV.x * 0.5f + 0.5f;
+
+	reflectScreenUV.x = ndcUV.x;
+
+
+	//reflectScreenUV.x = smoothstep(0.1f,0.9f, (reflectScreenUV.x*0.5f+0.5f)* _Intensity);
+
+	
+
+	//reflectScreenUV.x =pow(reflectScreenUV.x, _Intensity);
+	
+	//reflectScreenUV.x = saturate(reflectScreenUV.x * 0.5 + 0.5);
+
+	 
+	//#if UNITY_UV_STARTS_AT_TOP
+	//reflectScreenUV.y = 1.0 - reflectScreenUV.y;
+	//#endif
+	
+	
+
+	return  reflectScreenUV;
+
+}
+
+
+
+
+[numthreads(8, 8, 1)]
+void WriteHashRT(uint3 id:SV_DispatchThreadID) {
+
+	float2 screenUV = id.xy / _CameraSize.xy;
+
+	
+	float depth;
+
+
+	float3 WorldPos = ReBuildWorldPos(id.xy,depth);
+
+	if (WorldPos.y < _PlaneHeight+0.0001f)
+		return;
+
+
+    if (depth > 0.9999f)
+        return;
+	
+
+
+	float4 reflectPosCS;
+    float2 originReflectUV;
+	
+	float3 refWorldPos = MirrorWorldPos(WorldPos);
+
+
+    float2 refScreenUV = MirrorWorldPosToScreenUV(refWorldPos, WorldPos, reflectPosCS, originReflectUV);
+
+	
+	
+    float2 ReflectTexturePixelID = refScreenUV.xy * _CameraSize.xy;
+
+    uint projectionHash = id.y << 16 | id.x;
+
+	
+    float Offset;
+
+    if (isOffset(refScreenUV, originReflectUV, Offset) && _IsFill)
+    {
+		
+        Offset = 2.0f;		
+        const float2 offsets[9] =
+        {	
+            float2(0.0f, -Offset), float2(-Offset, -Offset),float2(-Offset, 0.0f), 
+			float2(-Offset, Offset),float2(0, Offset),float2(Offset, Offset),
+			float2(Offset, 0.0f),float2(Offset, -Offset),float2(0.0f, 0.0f)
+        };
+       
+	[unroll]
+    for (int i = 0; i < 9; i++)
+     {
+       InterlockedMin(HashBuffer[ReflectTexturePixelID + offsets[i]], projectionHash);
+     }	
+	 }
+    else
+    {
+        InterlockedMin(HashBuffer[ReflectTexturePixelID], projectionHash); 
+    }
+
+		
+
+
+
+
+
+}
+
+
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id:SV_DispatchThreadID) {
+
+
+	uint Hash = HashBuffer[id.xy].x;
+
+	
+	if (Hash != 0) {
+		uint x = Hash & 0xFFFF;
+		uint y = Hash >> 16;
+
+		ResultColor[id.xy] = _CurrentTexture[uint2(x, y)];
+	}
+
+}
+
+[numthreads(8, 8, 1)]
+void Clear(uint3 id:SV_DispatchThreadID) {
+
+	HashBuffer[id.xy] = MAX;
+	
+	ResultColor[id.xy] = float4(0, 0, 0, 0);
+
+}
+
+
+[numthreads(8, 8, 1)]
+void FillHoles(uint3 id:SV_DispatchThreadID) {
+
+	
+    id *= 2;
+
+    half4 center = ResultColor[id.xy + uint2(0, 0)];
+    half4 right = ResultColor[id.xy + uint2(0, 1)];
+    half4 bottom = ResultColor[id.xy + uint2(1, 0)];
+    half4 bottomRight = ResultColor[id.xy + uint2(1, 1)];
+
+
+
+    half4 best = center;
+    best = right.a > best.a ? right : best;
+    best = bottom.a > best.a ? bottom : best;
+    best = bottomRight.a > best.a ? bottomRight : best;
+
+
+
+    ResultColor[id.xy + uint2(0, 0)] = best.a > center.a ? best : center;
+    ResultColor[id.xy + uint2(0, 1)] = best.a > right.a ? best : right;
+    ResultColor[id.xy + uint2(1, 0)] = best.a > bottom.a ? best : bottom;
+    ResultColor[id.xy + uint2(1, 1)] = best.a > bottomRight.a ? best : bottomRight;
+
+}
+
+
+
